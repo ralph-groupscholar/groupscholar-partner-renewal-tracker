@@ -1,0 +1,11 @@
+partner_id,partner_name,last_contact_date,contract_end_date,engagement_score,meetings_last_90,referrals_last_90,issues_open,funding_commitment
+P-001,Northview Foundation,2026-01-10,2026-03-15,62,3,1,0,150000
+P-002,Bridge & Bloom,2025-11-22,2026-02-20,48,1,0,2,90000
+P-003,Metro Arts Collective,2025-09-30,2026-01-31,38,0,0,4,50000
+P-004,Spark Futures Initiative,2026-01-28,2026-06-30,72,4,2,0,220000
+P-005,Pathway Scholars Trust,2025-12-05,2026-04-01,54,1,0,1,110000
+P-006,Harborpoint Partners,2025-08-12,2025-12-31,41,0,0,5,70000
+P-007,Elevate Community Fund,2026-02-01,2026-05-15,67,2,1,0,180000
+P-008,Blue Oak Philanthropy,2025-10-18,2026-02-12,52,0,0,3,85000
+P-009,Westline Education Group,2026-01-02,2026-07-01,79,5,3,0,260000
+P-010,Beacon Path Partners,2025-11-05,2026-03-01,58,1,0,2,95000
