@@ -170,10 +170,13 @@ def load_partners(path: str) -> Tuple[List[PartnerRecord], List[str]]:
         for idx, row in enumerate(reader, start=2):
             partner_name = pick_field(row, "partner_name").strip()
             partner_id = pick_field(row, "partner_id").strip()
+            funding_raw = pick_field(row, "funding_commitment").strip()
             if not partner_name:
                 warnings.append(f"Row {idx}: missing partner_name")
             if not partner_id:
                 partner_id = f"row-{idx}"
+            if not funding_raw:
+                warnings.append(f"Row {idx}: missing funding_commitment")
             record = PartnerRecord(
                 partner_id=partner_id,
                 partner_name=partner_name or "Unknown",
@@ -183,10 +186,14 @@ def load_partners(path: str) -> Tuple[List[PartnerRecord], List[str]]:
                 meetings_last_90=parse_int(pick_field(row, "meetings_last_90")),
                 referrals_last_90=parse_int(pick_field(row, "referrals_last_90")),
                 issues_open=parse_int(pick_field(row, "issues_open")),
-                funding_commitment=parse_float(pick_field(row, "funding_commitment")),
+                funding_commitment=parse_float(funding_raw),
             )
             records.append(record)
     return records, warnings
+
+
+def compute_value_risk(risk: PartnerRisk) -> float:
+    return round(risk.record.funding_commitment * (risk.risk_score / 100.0), 2)
 
 
 def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_days: int) -> Dict[str, float]:
@@ -196,6 +203,22 @@ def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_
     low = sum(1 for r in risks if r.risk_tier == "low")
     expiring = sum(1 for r in risks if r.days_to_contract_end is not None and r.days_to_contract_end <= renewal_window_days)
     stale = sum(1 for r in risks if r.days_since_contact is not None and r.days_since_contact >= stale_contact_days)
+    total_funding = sum(r.record.funding_commitment for r in risks)
+    high_risk_funding = sum(r.record.funding_commitment for r in risks if r.risk_tier == "high")
+    expiring_funding = sum(
+        r.record.funding_commitment
+        for r in risks
+        if r.days_to_contract_end is not None and r.days_to_contract_end <= renewal_window_days
+    )
+    stale_funding = sum(
+        r.record.funding_commitment
+        for r in risks
+        if r.days_since_contact is not None and r.days_since_contact >= stale_contact_days
+    )
+    avg_value_risk = (
+        sum(compute_value_risk(r) for r in risks) / total
+        if total else 0.0
+    )
     avg_engagement = (
         sum(r.record.engagement_score for r in risks) / total
         if total else 0.0
@@ -213,10 +236,15 @@ def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_
         "stale_contacts": stale,
         "average_engagement": round(avg_engagement, 2),
         "average_risk_score": round(avg_score, 2),
+        "total_funding_commitment": round(total_funding, 2),
+        "high_risk_funding": round(high_risk_funding, 2),
+        "expiring_funding_within_window": round(expiring_funding, 2),
+        "stale_contact_funding": round(stale_funding, 2),
+        "average_value_at_risk": round(avg_value_risk, 2),
     }
 
 
-def render_console(summary: Dict[str, float], top: List[PartnerRisk]) -> None:
+def render_console(summary: Dict[str, float], top: List[PartnerRisk], top_value: List[PartnerRisk]) -> None:
     print("Partner Renewal Tracker")
     print("=" * 26)
     print(f"Total partners: {summary['total_partners']}")
@@ -225,6 +253,11 @@ def render_console(summary: Dict[str, float], top: List[PartnerRisk]) -> None:
     print(f"Stale contacts: {summary['stale_contacts']}")
     print(f"Average engagement: {summary['average_engagement']}")
     print(f"Average risk score: {summary['average_risk_score']}")
+    print(f"Total funding commitment: {summary['total_funding_commitment']}")
+    print(f"High-risk funding: {summary['high_risk_funding']}")
+    print(f"Expiring funding within window: {summary['expiring_funding_within_window']}")
+    print(f"Stale-contact funding: {summary['stale_contact_funding']}")
+    print(f"Average value at risk: {summary['average_value_at_risk']}")
     print("\nTop at-risk partners")
     print("-" * 26)
     if not top:
@@ -239,6 +272,16 @@ def render_console(summary: Dict[str, float], top: List[PartnerRisk]) -> None:
             f"{record.partner_name} ({record.partner_id}) | score {risk.risk_score} | tier {risk.risk_tier} | "
             f"days_to_end {days_to_end} | days_since_contact {days_since} | reasons: {reasons}"
         )
+    if top_value:
+        print("\nTop value at risk")
+        print("-" * 26)
+        for risk in top_value:
+            record = risk.record
+            value_risk = compute_value_risk(risk)
+            print(
+                f"{record.partner_name} ({record.partner_id}) | commitment {record.funding_commitment} | "
+                f"value_at_risk {value_risk} | score {risk.risk_score} | tier {risk.risk_tier}"
+            )
 
 
 def main() -> None:
@@ -247,6 +290,7 @@ def main() -> None:
     parser.add_argument("--as-of", help="Override as-of date (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--json-out", help="Optional path for JSON report output.")
     parser.add_argument("--top", type=int, default=10, help="How many top at-risk partners to show.")
+    parser.add_argument("--top-value", type=int, default=5, help="How many top value-at-risk partners to show.")
     parser.add_argument("--stale-contact-days", type=int, default=45)
     parser.add_argument("--renewal-window-days", type=int, default=90)
     parser.add_argument("--low-engagement-threshold", type=float, default=55.0)
@@ -275,9 +319,14 @@ def main() -> None:
     ]
 
     risks.sort(key=lambda r: (r.risk_score, r.record.partner_name), reverse=True)
+    value_ranked = sorted(
+        risks,
+        key=lambda r: (compute_value_risk(r), r.risk_score, r.record.partner_name),
+        reverse=True,
+    )
     summary = summarize(risks, args.renewal_window_days, args.stale_contact_days)
 
-    render_console(summary, risks[: args.top])
+    render_console(summary, risks[: args.top], value_ranked[: args.top_value])
 
     if warnings:
         print("\nWarnings")
@@ -304,6 +353,7 @@ def main() -> None:
                     "referrals_last_90": risk.record.referrals_last_90,
                     "issues_open": risk.record.issues_open,
                     "funding_commitment": risk.record.funding_commitment,
+                    "value_at_risk": compute_value_risk(risk),
                     "days_since_contact": risk.days_since_contact,
                     "days_to_contract_end": risk.days_to_contract_end,
                     "risk_score": risk.risk_score,
