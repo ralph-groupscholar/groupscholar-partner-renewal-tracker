@@ -11,6 +11,7 @@ DATE_FMT = "%Y-%m-%d"
 ALIASES = {
     "partner_id": ["partner_id", "partnerid", "id"],
     "partner_name": ["partner_name", "name", "partner"],
+    "owner": ["owner", "account_owner", "relationship_manager", "partner_owner"],
     "last_contact_date": ["last_contact_date", "last_contact", "last_contacted"],
     "contract_end_date": ["contract_end_date", "contract_end", "renewal_date"],
     "engagement_score": ["engagement_score", "engagement", "health_score"],
@@ -25,6 +26,7 @@ ALIASES = {
 class PartnerRecord:
     partner_id: str
     partner_name: str
+    owner: str
     last_contact_date: Optional[date]
     contract_end_date: Optional[date]
     engagement_score: float
@@ -43,6 +45,17 @@ class PartnerRisk:
     risk_tier: str
     expired: bool
     reasons: List[str]
+    action_code: str
+    action_note: str
+    action_priority: int
+
+
+@dataclass
+class PartnerAction:
+    risk: PartnerRisk
+    action_score: int
+    action: str
+    focus: str
 
 
 def parse_date(value: str) -> Optional[date]:
@@ -201,14 +214,30 @@ def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_
     high = sum(1 for r in risks if r.risk_tier == "high")
     medium = sum(1 for r in risks if r.risk_tier == "medium")
     low = sum(1 for r in risks if r.risk_tier == "low")
+    expired = sum(1 for r in risks if r.days_to_contract_end is not None and r.days_to_contract_end < 0)
     expiring = sum(1 for r in risks if r.days_to_contract_end is not None and r.days_to_contract_end <= renewal_window_days)
+    upcoming = sum(
+        1
+        for r in risks
+        if r.days_to_contract_end is not None and renewal_window_days < r.days_to_contract_end <= renewal_window_days * 2
+    )
     stale = sum(1 for r in risks if r.days_since_contact is not None and r.days_since_contact >= stale_contact_days)
     total_funding = sum(r.record.funding_commitment for r in risks)
     high_risk_funding = sum(r.record.funding_commitment for r in risks if r.risk_tier == "high")
+    expired_funding = sum(
+        r.record.funding_commitment
+        for r in risks
+        if r.days_to_contract_end is not None and r.days_to_contract_end < 0
+    )
     expiring_funding = sum(
         r.record.funding_commitment
         for r in risks
         if r.days_to_contract_end is not None and r.days_to_contract_end <= renewal_window_days
+    )
+    upcoming_funding = sum(
+        r.record.funding_commitment
+        for r in risks
+        if r.days_to_contract_end is not None and renewal_window_days < r.days_to_contract_end <= renewal_window_days * 2
     )
     stale_funding = sum(
         r.record.funding_commitment
@@ -232,30 +261,104 @@ def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_
         "high_risk": high,
         "medium_risk": medium,
         "low_risk": low,
+        "expired_contracts": expired,
         "expiring_within_window": expiring,
+        "upcoming_within_double_window": upcoming,
         "stale_contacts": stale,
         "average_engagement": round(avg_engagement, 2),
         "average_risk_score": round(avg_score, 2),
         "total_funding_commitment": round(total_funding, 2),
         "high_risk_funding": round(high_risk_funding, 2),
+        "expired_funding": round(expired_funding, 2),
         "expiring_funding_within_window": round(expiring_funding, 2),
+        "upcoming_funding_within_double_window": round(upcoming_funding, 2),
         "stale_contact_funding": round(stale_funding, 2),
         "average_value_at_risk": round(avg_value_risk, 2),
     }
 
 
-def render_console(summary: Dict[str, float], top: List[PartnerRisk], top_value: List[PartnerRisk]) -> None:
+def build_action_plan(
+    risk: PartnerRisk,
+    renewal_window_days: int,
+    stale_contact_days: int,
+    low_engagement_threshold: float,
+    high_issues_threshold: int,
+) -> PartnerAction:
+    action_score = risk.risk_score
+    action = "Monitor relationship"
+    focus = "monitor"
+
+    if risk.days_to_contract_end is not None and risk.days_to_contract_end < 0:
+        action_score += 30
+        action = "Escalate renewal recovery"
+        focus = "renewal_overdue"
+    elif risk.days_to_contract_end is not None and risk.days_to_contract_end <= renewal_window_days:
+        action_score += 20
+        action = "Launch renewal plan"
+        focus = "renewal_due"
+    elif risk.days_to_contract_end is None:
+        action_score += 15
+        action = "Confirm contract end date"
+        focus = "missing_contract"
+    elif risk.days_to_contract_end is not None and risk.days_to_contract_end <= renewal_window_days * 2:
+        action_score += 8
+        action = "Prep renewal runway"
+        focus = "renewal_horizon"
+
+    if risk.days_since_contact is None:
+        action_score += 15
+        if focus in {"monitor", "renewal_horizon", "missing_contract"}:
+            action = "Log last contact + schedule check-in"
+            focus = "missing_contact"
+    elif risk.days_since_contact >= stale_contact_days:
+        action_score += 15
+        if focus in {"monitor", "renewal_horizon", "missing_contract"}:
+            action = "Schedule relationship reset"
+            focus = "stale_contact"
+
+    if risk.record.engagement_score < low_engagement_threshold:
+        action_score += 10
+        if focus in {"monitor", "renewal_horizon"}:
+            action = "Deploy engagement plan"
+            focus = "low_engagement"
+
+    if risk.record.issues_open >= high_issues_threshold:
+        action_score += 8
+        if focus in {"monitor", "renewal_horizon"}:
+            action = "Resolve open issues"
+            focus = "issue_resolution"
+
+    action_score = min(action_score, 100)
+
+    return PartnerAction(
+        risk=risk,
+        action_score=action_score,
+        action=action,
+        focus=focus,
+    )
+
+
+def render_console(
+    summary: Dict[str, float],
+    top: List[PartnerRisk],
+    top_value: List[PartnerRisk],
+    actions: List[PartnerAction],
+) -> None:
     print("Partner Renewal Tracker")
     print("=" * 26)
     print(f"Total partners: {summary['total_partners']}")
     print(f"Risk mix: high {summary['high_risk']} | medium {summary['medium_risk']} | low {summary['low_risk']}")
+    print(f"Expired contracts: {summary['expired_contracts']}")
     print(f"Expiring within window: {summary['expiring_within_window']}")
+    print(f"Upcoming within 2x window: {summary['upcoming_within_double_window']}")
     print(f"Stale contacts: {summary['stale_contacts']}")
     print(f"Average engagement: {summary['average_engagement']}")
     print(f"Average risk score: {summary['average_risk_score']}")
     print(f"Total funding commitment: {summary['total_funding_commitment']}")
     print(f"High-risk funding: {summary['high_risk_funding']}")
+    print(f"Expired funding: {summary['expired_funding']}")
     print(f"Expiring funding within window: {summary['expiring_funding_within_window']}")
+    print(f"Upcoming funding within 2x window: {summary['upcoming_funding_within_double_window']}")
     print(f"Stale-contact funding: {summary['stale_contact_funding']}")
     print(f"Average value at risk: {summary['average_value_at_risk']}")
     print("\nTop at-risk partners")
@@ -282,6 +385,17 @@ def render_console(summary: Dict[str, float], top: List[PartnerRisk], top_value:
                 f"{record.partner_name} ({record.partner_id}) | commitment {record.funding_commitment} | "
                 f"value_at_risk {value_risk} | score {risk.risk_score} | tier {risk.risk_tier}"
             )
+    if actions:
+        print("\nAction queue")
+        print("-" * 26)
+        for item in actions:
+            record = item.risk.record
+            days_to_end = "n/a" if item.risk.days_to_contract_end is None else str(item.risk.days_to_contract_end)
+            days_since = "n/a" if item.risk.days_since_contact is None else str(item.risk.days_since_contact)
+            print(
+                f"{record.partner_name} ({record.partner_id}) | action_score {item.action_score} | "
+                f"{item.action} | focus {item.focus} | days_to_end {days_to_end} | days_since_contact {days_since}"
+            )
 
 
 def main() -> None:
@@ -291,6 +405,7 @@ def main() -> None:
     parser.add_argument("--json-out", help="Optional path for JSON report output.")
     parser.add_argument("--top", type=int, default=10, help="How many top at-risk partners to show.")
     parser.add_argument("--top-value", type=int, default=5, help="How many top value-at-risk partners to show.")
+    parser.add_argument("--top-actions", type=int, default=8, help="How many action queue partners to show.")
     parser.add_argument("--stale-contact-days", type=int, default=45)
     parser.add_argument("--renewal-window-days", type=int, default=90)
     parser.add_argument("--low-engagement-threshold", type=float, default=55.0)
@@ -324,9 +439,20 @@ def main() -> None:
         key=lambda r: (compute_value_risk(r), r.risk_score, r.record.partner_name),
         reverse=True,
     )
+    actions = [
+        build_action_plan(
+            risk,
+            args.renewal_window_days,
+            args.stale_contact_days,
+            args.low_engagement_threshold,
+            args.high_issues_threshold,
+        )
+        for risk in risks
+    ]
+    actions.sort(key=lambda item: (item.action_score, item.risk.risk_score, item.risk.record.partner_name), reverse=True)
     summary = summarize(risks, args.renewal_window_days, args.stale_contact_days)
 
-    render_console(summary, risks[: args.top], value_ranked[: args.top_value])
+    render_console(summary, risks[: args.top], value_ranked[: args.top_value], actions[: args.top_actions])
 
     if warnings:
         print("\nWarnings")
@@ -362,6 +488,20 @@ def main() -> None:
                     "reasons": risk.reasons,
                 }
                 for risk in risks
+            ],
+            "action_queue": [
+                {
+                    "partner_id": item.risk.record.partner_id,
+                    "partner_name": item.risk.record.partner_name,
+                    "action_score": item.action_score,
+                    "action": item.action,
+                    "focus": item.focus,
+                    "days_to_contract_end": item.risk.days_to_contract_end,
+                    "days_since_contact": item.risk.days_since_contact,
+                    "risk_score": item.risk.risk_score,
+                    "risk_tier": item.risk.risk_tier,
+                }
+                for item in actions
             ],
         }
         with open(args.json_out, "w", encoding="utf-8") as handle:

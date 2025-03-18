@@ -6,3 +6,4 @@
 - Added sample dataset and documentation.
 - Added funding-at-risk summaries, value-at-risk ranking, and warnings for missing commitments.
 - Expanded console/JSON outputs and documented the new controls.
+- Added contract horizon/funding buckets plus an action queue with prioritized renewal/outreach recommendations and JSON output.
