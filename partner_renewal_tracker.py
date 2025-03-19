@@ -162,6 +162,25 @@ def compute_risk(
     else:
         tier = "low"
 
+    action_code, action_note = recommend_action(
+        record,
+        days_since_contact,
+        days_to_contract_end,
+        expired,
+        stale_contact_days,
+        renewal_window_days,
+        low_engagement_threshold,
+        high_issues_threshold,
+    )
+    action_priority = compute_action_priority(
+        score,
+        days_since_contact,
+        days_to_contract_end,
+        expired,
+        stale_contact_days,
+        renewal_window_days,
+    )
+
     return PartnerRisk(
         record=record,
         days_since_contact=days_since_contact,
@@ -170,6 +189,9 @@ def compute_risk(
         risk_tier=tier,
         expired=expired,
         reasons=reasons,
+        action_code=action_code,
+        action_note=action_note,
+        action_priority=action_priority,
     )
 
 
@@ -190,9 +212,11 @@ def load_partners(path: str) -> Tuple[List[PartnerRecord], List[str]]:
                 partner_id = f"row-{idx}"
             if not funding_raw:
                 warnings.append(f"Row {idx}: missing funding_commitment")
+            owner = pick_field(row, "owner").strip() or "Unassigned"
             record = PartnerRecord(
                 partner_id=partner_id,
                 partner_name=partner_name or "Unknown",
+                owner=owner,
                 last_contact_date=parse_date(pick_field(row, "last_contact_date")),
                 contract_end_date=parse_date(pick_field(row, "contract_end_date")),
                 engagement_score=parse_float(pick_field(row, "engagement_score")),
@@ -207,6 +231,54 @@ def load_partners(path: str) -> Tuple[List[PartnerRecord], List[str]]:
 
 def compute_value_risk(risk: PartnerRisk) -> float:
     return round(risk.record.funding_commitment * (risk.risk_score / 100.0), 2)
+
+
+def compute_action_priority(
+    risk_score: int,
+    days_since_contact: Optional[int],
+    days_to_contract_end: Optional[int],
+    expired: bool,
+    stale_contact_days: int,
+    renewal_window_days: int,
+) -> int:
+    priority = risk_score
+    if expired:
+        priority += 25
+    if days_to_contract_end is not None:
+        if days_to_contract_end <= renewal_window_days:
+            priority += 20
+        elif days_to_contract_end <= renewal_window_days * 2:
+            priority += 10
+    if days_since_contact is None or days_since_contact >= stale_contact_days:
+        priority += 10
+    return min(priority, 120)
+
+
+def recommend_action(
+    record: PartnerRecord,
+    days_since_contact: Optional[int],
+    days_to_contract_end: Optional[int],
+    expired: bool,
+    stale_contact_days: int,
+    renewal_window_days: int,
+    low_engagement_threshold: float,
+    high_issues_threshold: int,
+) -> Tuple[str, str]:
+    if expired:
+        return "renewal_overdue", "Renewal overdue: re-engage + confirm commitment"
+    if days_to_contract_end is not None and days_to_contract_end <= renewal_window_days:
+        return "launch_renewal", "Launch renewal: confirm intent + timeline"
+    if days_since_contact is None or days_since_contact >= stale_contact_days:
+        return "reconnect", "Reconnect: schedule check-in"
+    if record.engagement_score < low_engagement_threshold:
+        return "rebuild_engagement", "Rebuild engagement: share impact + invite"
+    if record.issues_open >= high_issues_threshold or record.issues_open > 0:
+        return "resolve_issues", "Resolve issues: close blockers"
+    if record.meetings_last_90 == 0:
+        return "schedule_meeting", "Schedule meeting: align on goals"
+    if record.referrals_last_90 == 0:
+        return "spark_referrals", "Spark referrals: propose scholar match"
+    return "monitor", "Monitor: steady state"
 
 
 def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_days: int) -> Dict[str, float]:
