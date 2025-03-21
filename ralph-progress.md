@@ -7,3 +7,4 @@
 - Added funding-at-risk summaries, value-at-risk ranking, and warnings for missing commitments.
 - Expanded console/JSON outputs and documented the new controls.
 - Added contract horizon/funding buckets plus an action queue with prioritized renewal/outreach recommendations and JSON output.
+- Added an owner risk snapshot with expiring/value-at-risk summaries plus JSON output and CLI control for top owners.

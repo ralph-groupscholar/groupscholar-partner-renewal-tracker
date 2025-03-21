@@ -8,6 +8,7 @@ A lightweight CLI that turns partner engagement exports into renewal risk signal
 - Outputs a concise summary plus ranked lists for risk and renewal value at risk
 - Highlights funding commitments tied to expiring or stale relationships
 - Adds an action queue with recommended next steps and priority scores
+- Provides an owner risk snapshot to focus renewal outreach by owner
 - Emits JSON reports for downstream dashboards
 - Works with simple CSV exports (aliases for common header names)
 
@@ -21,6 +22,7 @@ python3 partner_renewal_tracker.py --input sample/partners.csv --as-of 2026-02-0
 - `--top` (default 10): how many partners to list
 - `--top-value` (default 5): how many value-at-risk partners to list
 - `--top-actions` (default 8): how many action queue entries to list
+- `--top-owners` (default 6): how many owners to list in snapshot
 - `--stale-contact-days` (default 45)
 - `--renewal-window-days` (default 90)
 - `--low-engagement-threshold` (default 55)

@@ -21,6 +21,32 @@ ALIASES = {
     "funding_commitment": ["funding_commitment", "commitment", "annual_commitment"],
 }
 
+WEIGHT_PROFILES = {
+    "balanced": {
+        "contact": 1.0,
+        "contract": 1.0,
+        "engagement": 1.0,
+        "issues": 1.0,
+        "meetings": 1.0,
+        "referrals": 1.0,
+    },
+    "renewal-heavy": {
+        "contact": 1.0,
+        "contract": 1.35,
+        "engagement": 0.95,
+        "issues": 1.05,
+        "meetings": 0.9,
+        "referrals": 0.9,
+    },
+    "engagement-heavy": {
+        "contact": 1.2,
+        "contract": 0.9,
+        "engagement": 1.25,
+        "issues": 1.1,
+        "meetings": 1.1,
+        "referrals": 1.05,
+    },
+}
 
 @dataclass
 class PartnerRecord:
@@ -96,21 +122,27 @@ def compute_risk(
     renewal_window_days: int,
     low_engagement_threshold: float,
     high_issues_threshold: int,
+    weights: Dict[str, float],
 ) -> PartnerRisk:
     reasons: List[str] = []
-    score = 0
+    contact_score = 0.0
+    contract_score = 0.0
+    engagement_score = 0.0
+    issues_score = 0.0
+    meetings_score = 0.0
+    referrals_score = 0.0
 
     days_since_contact = None
     if record.last_contact_date:
         days_since_contact = (as_of - record.last_contact_date).days
         if days_since_contact >= stale_contact_days:
-            score += 25
+            contact_score += 25
             reasons.append("stale_contact")
         elif days_since_contact >= stale_contact_days // 2:
-            score += 10
+            contact_score += 10
             reasons.append("contact_cooling")
     else:
-        score += 20
+        contact_score += 20
         reasons.append("missing_contact_date")
 
     days_to_contract_end = None
@@ -118,42 +150,50 @@ def compute_risk(
     if record.contract_end_date:
         days_to_contract_end = (record.contract_end_date - as_of).days
         if days_to_contract_end < 0:
-            score += 20
+            contract_score += 20
             expired = True
             reasons.append("contract_expired")
         elif days_to_contract_end <= renewal_window_days:
-            score += 30
+            contract_score += 30
             reasons.append("renewal_window")
         elif days_to_contract_end <= renewal_window_days * 2:
-            score += 10
+            contract_score += 10
             reasons.append("renewal_horizon")
     else:
-        score += 15
+        contract_score += 15
         reasons.append("missing_contract_end")
 
     if record.engagement_score < low_engagement_threshold:
-        score += 20
+        engagement_score += 20
         reasons.append("low_engagement")
     elif record.engagement_score < low_engagement_threshold + 10:
-        score += 10
+        engagement_score += 10
         reasons.append("soft_engagement")
 
     if record.issues_open >= high_issues_threshold:
-        score += 15
+        issues_score += 15
         reasons.append("issues_high")
     elif record.issues_open > 0:
-        score += 5
+        issues_score += 5
         reasons.append("issues_open")
 
     if record.meetings_last_90 == 0:
-        score += 10
+        meetings_score += 10
         reasons.append("no_recent_meetings")
 
     if record.referrals_last_90 == 0:
-        score += 5
+        referrals_score += 5
         reasons.append("no_recent_referrals")
 
-    score = min(score, 100)
+    weighted_score = (
+        contact_score * weights["contact"]
+        + contract_score * weights["contract"]
+        + engagement_score * weights["engagement"]
+        + issues_score * weights["issues"]
+        + meetings_score * weights["meetings"]
+        + referrals_score * weights["referrals"]
+    )
+    score = min(int(round(weighted_score)), 100)
 
     if score >= 70:
         tier = "high"
@@ -281,7 +321,12 @@ def recommend_action(
     return "monitor", "Monitor: steady state"
 
 
-def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_days: int) -> Dict[str, float]:
+def summarize(
+    risks: List[PartnerRisk],
+    renewal_window_days: int,
+    stale_contact_days: int,
+    weights: Dict[str, float],
+) -> Dict[str, object]:
     total = len(risks)
     high = sum(1 for r in risks if r.risk_tier == "high")
     medium = sum(1 for r in risks if r.risk_tier == "medium")
@@ -329,6 +374,7 @@ def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_
         if total else 0.0
     )
     return {
+        "weight_profile": weights,
         "total_partners": total,
         "high_risk": high,
         "medium_risk": medium,
@@ -347,6 +393,79 @@ def summarize(risks: List[PartnerRisk], renewal_window_days: int, stale_contact_
         "stale_contact_funding": round(stale_funding, 2),
         "average_value_at_risk": round(avg_value_risk, 2),
     }
+
+
+def resolve_weights(
+    profile: str,
+    contact: Optional[float],
+    contract: Optional[float],
+    engagement: Optional[float],
+    issues: Optional[float],
+    meetings: Optional[float],
+    referrals: Optional[float],
+) -> Dict[str, float]:
+    base = WEIGHT_PROFILES.get(profile, WEIGHT_PROFILES["balanced"]).copy()
+    overrides = {
+        "contact": contact,
+        "contract": contract,
+        "engagement": engagement,
+        "issues": issues,
+        "meetings": meetings,
+        "referrals": referrals,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            base[key] = max(value, 0.0)
+    return base
+
+
+def build_owner_summary(
+    risks: List[PartnerRisk],
+    renewal_window_days: int,
+    stale_contact_days: int,
+) -> List[Dict[str, float]]:
+    owners: Dict[str, List[PartnerRisk]] = {}
+    for risk in risks:
+        owners.setdefault(risk.record.owner, []).append(risk)
+
+    snapshots: List[Dict[str, float]] = []
+    for owner, items in owners.items():
+        total = len(items)
+        total_funding = sum(r.record.funding_commitment for r in items)
+        value_at_risk = sum(compute_value_risk(r) for r in items)
+        avg_risk = sum(r.risk_score for r in items) / total if total else 0.0
+        avg_engagement = sum(r.record.engagement_score for r in items) / total if total else 0.0
+        expiring = sum(
+            1
+            for r in items
+            if r.days_to_contract_end is not None and r.days_to_contract_end <= renewal_window_days
+        )
+        expired = sum(1 for r in items if r.days_to_contract_end is not None and r.days_to_contract_end < 0)
+        stale = sum(1 for r in items if r.days_since_contact is not None and r.days_since_contact >= stale_contact_days)
+        high = sum(1 for r in items if r.risk_tier == "high")
+        medium = sum(1 for r in items if r.risk_tier == "medium")
+        low = sum(1 for r in items if r.risk_tier == "low")
+        snapshots.append(
+            {
+                "owner": owner,
+                "total_partners": total,
+                "high_risk": high,
+                "medium_risk": medium,
+                "low_risk": low,
+                "expired_contracts": expired,
+                "expiring_within_window": expiring,
+                "stale_contacts": stale,
+                "average_risk_score": round(avg_risk, 2),
+                "average_engagement": round(avg_engagement, 2),
+                "total_funding_commitment": round(total_funding, 2),
+                "value_at_risk": round(value_at_risk, 2),
+            }
+        )
+    snapshots.sort(
+        key=lambda s: (s["value_at_risk"], s["average_risk_score"], s["total_funding_commitment"]),
+        reverse=True,
+    )
+    return snapshots
 
 
 def build_action_plan(
@@ -415,6 +534,8 @@ def render_console(
     top: List[PartnerRisk],
     top_value: List[PartnerRisk],
     actions: List[PartnerAction],
+    owners: List[Dict[str, float]],
+    top_owners: int,
 ) -> None:
     print("Partner Renewal Tracker")
     print("=" * 26)
@@ -468,6 +589,15 @@ def render_console(
                 f"{record.partner_name} ({record.partner_id}) | action_score {item.action_score} | "
                 f"{item.action} | focus {item.focus} | days_to_end {days_to_end} | days_since_contact {days_since}"
             )
+    if owners:
+        print("\nOwner risk snapshot")
+        print("-" * 26)
+        for owner in owners[:top_owners]:
+            print(
+                f"{owner['owner']} | partners {owner['total_partners']} | high {owner['high_risk']} | "
+                f"expiring {owner['expiring_within_window']} | value_at_risk {owner['value_at_risk']} | "
+                f"avg_risk {owner['average_risk_score']}"
+            )
 
 
 def main() -> None:
@@ -478,6 +608,7 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=10, help="How many top at-risk partners to show.")
     parser.add_argument("--top-value", type=int, default=5, help="How many top value-at-risk partners to show.")
     parser.add_argument("--top-actions", type=int, default=8, help="How many action queue partners to show.")
+    parser.add_argument("--top-owners", type=int, default=6, help="How many owners to list in snapshot.")
     parser.add_argument("--stale-contact-days", type=int, default=45)
     parser.add_argument("--renewal-window-days", type=int, default=90)
     parser.add_argument("--low-engagement-threshold", type=float, default=55.0)
@@ -523,8 +654,16 @@ def main() -> None:
     ]
     actions.sort(key=lambda item: (item.action_score, item.risk.risk_score, item.risk.record.partner_name), reverse=True)
     summary = summarize(risks, args.renewal_window_days, args.stale_contact_days)
+    owner_summary = build_owner_summary(risks, args.renewal_window_days, args.stale_contact_days)
 
-    render_console(summary, risks[: args.top], value_ranked[: args.top_value], actions[: args.top_actions])
+    render_console(
+        summary,
+        risks[: args.top],
+        value_ranked[: args.top_value],
+        actions[: args.top_actions],
+        owner_summary,
+        args.top_owners,
+    )
 
     if warnings:
         print("\nWarnings")
@@ -536,6 +675,7 @@ def main() -> None:
         payload = {
             "as_of": as_of.strftime(DATE_FMT),
             "summary": summary,
+            "owner_summary": owner_summary,
             "partners": [
                 {
                     "partner_id": risk.record.partner_id,
