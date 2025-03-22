@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple
@@ -395,6 +396,294 @@ def summarize(
     }
 
 
+def load_pg_dsn() -> str:
+    dsn = os.environ.get("GS_PG_DSN")
+    if dsn:
+        return dsn
+    host = os.environ.get("PGHOST")
+    user = os.environ.get("PGUSER")
+    password = os.environ.get("PGPASSWORD")
+    port = os.environ.get("PGPORT")
+    database = os.environ.get("PGDATABASE")
+    if not host or not user or not password or not database:
+        raise SystemExit(
+            "Postgres export requires GS_PG_DSN or PGHOST/PGUSER/PGPASSWORD/PGDATABASE env vars."
+        )
+    port = port or "5432"
+    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+
+
+def ensure_schema(cursor, schema: str) -> None:
+    cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.renewal_runs (
+            id SERIAL PRIMARY KEY,
+            run_label TEXT,
+            as_of DATE NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            renewal_window_days INTEGER NOT NULL,
+            stale_contact_days INTEGER NOT NULL,
+            low_engagement_threshold NUMERIC NOT NULL,
+            high_issues_threshold INTEGER NOT NULL,
+            weight_profile JSONB NOT NULL,
+            total_partners INTEGER NOT NULL,
+            high_risk INTEGER NOT NULL,
+            medium_risk INTEGER NOT NULL,
+            low_risk INTEGER NOT NULL,
+            expired_contracts INTEGER NOT NULL,
+            expiring_within_window INTEGER NOT NULL,
+            upcoming_within_double_window INTEGER NOT NULL,
+            stale_contacts INTEGER NOT NULL,
+            average_engagement NUMERIC NOT NULL,
+            average_risk_score NUMERIC NOT NULL,
+            total_funding_commitment NUMERIC NOT NULL,
+            high_risk_funding NUMERIC NOT NULL,
+            expired_funding NUMERIC NOT NULL,
+            expiring_funding_within_window NUMERIC NOT NULL,
+            upcoming_funding_within_double_window NUMERIC NOT NULL,
+            stale_contact_funding NUMERIC NOT NULL,
+            average_value_at_risk NUMERIC NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.partner_scores (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES {schema}.renewal_runs(id) ON DELETE CASCADE,
+            partner_id TEXT NOT NULL,
+            partner_name TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            last_contact_date DATE,
+            contract_end_date DATE,
+            engagement_score NUMERIC NOT NULL,
+            meetings_last_90 INTEGER NOT NULL,
+            referrals_last_90 INTEGER NOT NULL,
+            issues_open INTEGER NOT NULL,
+            funding_commitment NUMERIC NOT NULL,
+            value_at_risk NUMERIC NOT NULL,
+            days_since_contact INTEGER,
+            days_to_contract_end INTEGER,
+            risk_score INTEGER NOT NULL,
+            risk_tier TEXT NOT NULL,
+            expired BOOLEAN NOT NULL,
+            reasons TEXT[] NOT NULL,
+            action_code TEXT NOT NULL,
+            action_note TEXT NOT NULL,
+            action_priority INTEGER NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.action_queue (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES {schema}.renewal_runs(id) ON DELETE CASCADE,
+            partner_id TEXT NOT NULL,
+            partner_name TEXT NOT NULL,
+            action_score INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            focus TEXT NOT NULL,
+            days_to_contract_end INTEGER,
+            days_since_contact INTEGER,
+            risk_score INTEGER NOT NULL,
+            risk_tier TEXT NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.owner_summary (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES {schema}.renewal_runs(id) ON DELETE CASCADE,
+            owner TEXT NOT NULL,
+            total_partners INTEGER NOT NULL,
+            high_risk INTEGER NOT NULL,
+            medium_risk INTEGER NOT NULL,
+            low_risk INTEGER NOT NULL,
+            expired_contracts INTEGER NOT NULL,
+            expiring_within_window INTEGER NOT NULL,
+            stale_contacts INTEGER NOT NULL,
+            average_risk_score NUMERIC NOT NULL,
+            average_engagement NUMERIC NOT NULL,
+            total_funding_commitment NUMERIC NOT NULL,
+            value_at_risk NUMERIC NOT NULL
+        )
+        """
+    )
+
+
+def export_to_postgres(
+    risks: List[PartnerRisk],
+    actions: List[PartnerAction],
+    owner_summary: List[Dict[str, float]],
+    summary: Dict[str, object],
+    as_of: date,
+    args: argparse.Namespace,
+) -> None:
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise SystemExit("psycopg is required for --export-postgres. Install with pip.") from exc
+
+    dsn = load_pg_dsn()
+    schema = os.environ.get("GS_PG_SCHEMA", "groupscholar_partner_renewal_tracker")
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cursor:
+            ensure_schema(cursor, schema)
+            cursor.execute(
+                f"""
+                INSERT INTO {schema}.renewal_runs (
+                    run_label, as_of, renewal_window_days, stale_contact_days,
+                    low_engagement_threshold, high_issues_threshold, weight_profile,
+                    total_partners, high_risk, medium_risk, low_risk, expired_contracts,
+                    expiring_within_window, upcoming_within_double_window, stale_contacts,
+                    average_engagement, average_risk_score, total_funding_commitment,
+                    high_risk_funding, expired_funding, expiring_funding_within_window,
+                    upcoming_funding_within_double_window, stale_contact_funding,
+                    average_value_at_risk
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s
+                )
+                RETURNING id
+                """,
+                (
+                    args.run_label,
+                    as_of,
+                    args.renewal_window_days,
+                    args.stale_contact_days,
+                    args.low_engagement_threshold,
+                    args.high_issues_threshold,
+                    json.dumps(summary["weight_profile"]),
+                    summary["total_partners"],
+                    summary["high_risk"],
+                    summary["medium_risk"],
+                    summary["low_risk"],
+                    summary["expired_contracts"],
+                    summary["expiring_within_window"],
+                    summary["upcoming_within_double_window"],
+                    summary["stale_contacts"],
+                    summary["average_engagement"],
+                    summary["average_risk_score"],
+                    summary["total_funding_commitment"],
+                    summary["high_risk_funding"],
+                    summary["expired_funding"],
+                    summary["expiring_funding_within_window"],
+                    summary["upcoming_funding_within_double_window"],
+                    summary["stale_contact_funding"],
+                    summary["average_value_at_risk"],
+                ),
+            )
+            run_id = cursor.fetchone()[0]
+
+            cursor.executemany(
+                f"""
+                INSERT INTO {schema}.partner_scores (
+                    run_id, partner_id, partner_name, owner, last_contact_date, contract_end_date,
+                    engagement_score, meetings_last_90, referrals_last_90, issues_open,
+                    funding_commitment, value_at_risk, days_since_contact, days_to_contract_end,
+                    risk_score, risk_tier, expired, reasons, action_code, action_note, action_priority
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                [
+                    (
+                        run_id,
+                        risk.record.partner_id,
+                        risk.record.partner_name,
+                        risk.record.owner,
+                        risk.record.last_contact_date,
+                        risk.record.contract_end_date,
+                        risk.record.engagement_score,
+                        risk.record.meetings_last_90,
+                        risk.record.referrals_last_90,
+                        risk.record.issues_open,
+                        risk.record.funding_commitment,
+                        compute_value_risk(risk),
+                        risk.days_since_contact,
+                        risk.days_to_contract_end,
+                        risk.risk_score,
+                        risk.risk_tier,
+                        risk.expired,
+                        risk.reasons,
+                        risk.action_code,
+                        risk.action_note,
+                        risk.action_priority,
+                    )
+                    for risk in risks
+                ],
+            )
+
+            cursor.executemany(
+                f"""
+                INSERT INTO {schema}.action_queue (
+                    run_id, partner_id, partner_name, action_score, action, focus,
+                    days_to_contract_end, days_since_contact, risk_score, risk_tier
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        run_id,
+                        item.risk.record.partner_id,
+                        item.risk.record.partner_name,
+                        item.action_score,
+                        item.action,
+                        item.focus,
+                        item.risk.days_to_contract_end,
+                        item.risk.days_since_contact,
+                        item.risk.risk_score,
+                        item.risk.risk_tier,
+                    )
+                    for item in actions
+                ],
+            )
+
+            cursor.executemany(
+                f"""
+                INSERT INTO {schema}.owner_summary (
+                    run_id, owner, total_partners, high_risk, medium_risk, low_risk,
+                    expired_contracts, expiring_within_window, stale_contacts,
+                    average_risk_score, average_engagement, total_funding_commitment, value_at_risk
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        run_id,
+                        owner["owner"],
+                        owner["total_partners"],
+                        owner["high_risk"],
+                        owner["medium_risk"],
+                        owner["low_risk"],
+                        owner["expired_contracts"],
+                        owner["expiring_within_window"],
+                        owner["stale_contacts"],
+                        owner["average_risk_score"],
+                        owner["average_engagement"],
+                        owner["total_funding_commitment"],
+                        owner["value_at_risk"],
+                    )
+                    for owner in owner_summary
+                ],
+            )
+
+
 def resolve_weights(
     profile: str,
     contact: Optional[float],
@@ -605,6 +894,8 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Path to partner CSV export.")
     parser.add_argument("--as-of", help="Override as-of date (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--json-out", help="Optional path for JSON report output.")
+    parser.add_argument("--export-postgres", action="store_true", help="Write results to Postgres.")
+    parser.add_argument("--run-label", help="Optional label to store with Postgres run.")
     parser.add_argument("--top", type=int, default=10, help="How many top at-risk partners to show.")
     parser.add_argument("--top-value", type=int, default=5, help="How many top value-at-risk partners to show.")
     parser.add_argument("--top-actions", type=int, default=8, help="How many action queue partners to show.")
@@ -613,6 +904,13 @@ def main() -> None:
     parser.add_argument("--renewal-window-days", type=int, default=90)
     parser.add_argument("--low-engagement-threshold", type=float, default=55.0)
     parser.add_argument("--high-issues-threshold", type=int, default=3)
+    parser.add_argument("--weight-profile", default="balanced", choices=sorted(WEIGHT_PROFILES))
+    parser.add_argument("--weight-contact", type=float)
+    parser.add_argument("--weight-contract", type=float)
+    parser.add_argument("--weight-engagement", type=float)
+    parser.add_argument("--weight-issues", type=float)
+    parser.add_argument("--weight-meetings", type=float)
+    parser.add_argument("--weight-referrals", type=float)
 
     args = parser.parse_args()
 
@@ -623,6 +921,16 @@ def main() -> None:
             raise SystemExit("Invalid --as-of date. Use YYYY-MM-DD.")
         as_of = parsed
 
+    weights = resolve_weights(
+        args.weight_profile,
+        args.weight_contact,
+        args.weight_contract,
+        args.weight_engagement,
+        args.weight_issues,
+        args.weight_meetings,
+        args.weight_referrals,
+    )
+
     records, warnings = load_partners(args.input)
     risks = [
         compute_risk(
@@ -632,6 +940,7 @@ def main() -> None:
             args.renewal_window_days,
             args.low_engagement_threshold,
             args.high_issues_threshold,
+            weights,
         )
         for record in records
     ]
@@ -653,7 +962,7 @@ def main() -> None:
         for risk in risks
     ]
     actions.sort(key=lambda item: (item.action_score, item.risk.risk_score, item.risk.record.partner_name), reverse=True)
-    summary = summarize(risks, args.renewal_window_days, args.stale_contact_days)
+    summary = summarize(risks, args.renewal_window_days, args.stale_contact_days, weights)
     owner_summary = build_owner_summary(risks, args.renewal_window_days, args.stale_contact_days)
 
     render_console(
@@ -718,6 +1027,9 @@ def main() -> None:
         }
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+
+    if args.export_postgres:
+        export_to_postgres(risks, actions, owner_summary, summary, as_of, args)
 
 
 if __name__ == "__main__":

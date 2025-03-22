@@ -18,6 +18,15 @@ A lightweight CLI that turns partner engagement exports into renewal risk signal
 python3 partner_renewal_tracker.py --input sample/partners.csv --as-of 2026-02-07 --json-out report.json
 ```
 
+Store a run in Postgres (production):
+
+```bash
+export GS_PG_DSN="postgresql://USER:PASSWORD@HOST:PORT/DATABASE"
+python3 partner_renewal_tracker.py --input sample/partners.csv --export-postgres --run-label "baseline"
+```
+
+Note: Postgres export is intended for deployed/production usage. Do not point it at local dev databases.
+
 ### Options
 - `--top` (default 10): how many partners to list
 - `--top-value` (default 5): how many value-at-risk partners to list
@@ -27,6 +36,10 @@ python3 partner_renewal_tracker.py --input sample/partners.csv --as-of 2026-02-0
 - `--renewal-window-days` (default 90)
 - `--low-engagement-threshold` (default 55)
 - `--high-issues-threshold` (default 3)
+- `--weight-profile` (balanced, engagement-heavy, renewal-heavy)
+- `--weight-contact`, `--weight-contract`, `--weight-engagement`, `--weight-issues`, `--weight-meetings`, `--weight-referrals`
+- `--export-postgres`: store results in Postgres (requires env vars)
+- `--run-label`: optional label stored with the Postgres run
 
 ## Input schema
 Expected headers (aliases accepted):
@@ -46,8 +59,9 @@ Expected headers (aliases accepted):
 - Optional JSON report with full partner risk details and value-at-risk calculations
 
 ## Tech
-- Python 3 (standard library only)
+- Python 3
+- psycopg (for Postgres export)
 
 ## Next steps
-- Add configurable weighting profiles (renewal-heavy vs engagement-heavy)
+- Add CSV export for BI pipelines
 - Export CSV snapshots for BI pipelines
