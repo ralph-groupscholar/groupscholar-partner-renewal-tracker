@@ -13,3 +13,6 @@
 - Added configurable weight profiles/overrides and Postgres export support for renewal runs.
 - Created production schema/tables and seeded the database with sample partner data.
 - Documented Postgres usage and added psycopg requirements.
+
+## 2026-02-08
+- Added CSV export outputs for partner risk, action queue, and owner summaries.

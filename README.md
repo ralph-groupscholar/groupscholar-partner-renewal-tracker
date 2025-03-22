@@ -10,12 +10,19 @@ A lightweight CLI that turns partner engagement exports into renewal risk signal
 - Adds an action queue with recommended next steps and priority scores
 - Provides an owner risk snapshot to focus renewal outreach by owner
 - Emits JSON reports for downstream dashboards
+- Exports CSV snapshots for partners, actions, and owner summaries
 - Works with simple CSV exports (aliases for common header names)
 
 ## Usage
 
 ```bash
 python3 partner_renewal_tracker.py --input sample/partners.csv --as-of 2026-02-07 --json-out report.json
+```
+
+Export CSV snapshots:
+
+```bash
+python3 partner_renewal_tracker.py --input sample/partners.csv --csv-out partners.csv --actions-csv-out actions.csv --owners-csv-out owners.csv
 ```
 
 Store a run in Postgres (production):
@@ -38,6 +45,9 @@ Note: Postgres export is intended for deployed/production usage. Do not point it
 - `--high-issues-threshold` (default 3)
 - `--weight-profile` (balanced, engagement-heavy, renewal-heavy)
 - `--weight-contact`, `--weight-contract`, `--weight-engagement`, `--weight-issues`, `--weight-meetings`, `--weight-referrals`
+- `--csv-out`: CSV export path for partner risk snapshot
+- `--actions-csv-out`: CSV export path for action queue snapshot
+- `--owners-csv-out`: CSV export path for owner summary snapshot
 - `--export-postgres`: store results in Postgres (requires env vars)
 - `--run-label`: optional label stored with the Postgres run
 
@@ -63,5 +73,4 @@ Expected headers (aliases accepted):
 - psycopg (for Postgres export)
 
 ## Next steps
-- Add CSV export for BI pipelines
-- Export CSV snapshots for BI pipelines
+- Add lightweight HTML report output

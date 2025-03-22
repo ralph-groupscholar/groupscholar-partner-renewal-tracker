@@ -818,6 +818,16 @@ def build_action_plan(
     )
 
 
+def write_csv(path: str, rows: List[Dict[str, object]], fieldnames: List[str]) -> None:
+    if not path:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def render_console(
     summary: Dict[str, float],
     top: List[PartnerRisk],
@@ -894,6 +904,9 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Path to partner CSV export.")
     parser.add_argument("--as-of", help="Override as-of date (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--json-out", help="Optional path for JSON report output.")
+    parser.add_argument("--csv-out", help="Optional path for partner risk CSV export.")
+    parser.add_argument("--actions-csv-out", help="Optional path for action queue CSV export.")
+    parser.add_argument("--owners-csv-out", help="Optional path for owner summary CSV export.")
     parser.add_argument("--export-postgres", action="store_true", help="Write results to Postgres.")
     parser.add_argument("--run-label", help="Optional label to store with Postgres run.")
     parser.add_argument("--top", type=int, default=10, help="How many top at-risk partners to show.")
@@ -1027,6 +1040,137 @@ def main() -> None:
         }
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+
+    if args.csv_out:
+        partner_rows = [
+            {
+                "partner_id": risk.record.partner_id,
+                "partner_name": risk.record.partner_name,
+                "owner": risk.record.owner,
+                "last_contact_date": risk.record.last_contact_date.strftime(DATE_FMT)
+                if risk.record.last_contact_date
+                else "",
+                "contract_end_date": risk.record.contract_end_date.strftime(DATE_FMT)
+                if risk.record.contract_end_date
+                else "",
+                "engagement_score": risk.record.engagement_score,
+                "meetings_last_90": risk.record.meetings_last_90,
+                "referrals_last_90": risk.record.referrals_last_90,
+                "issues_open": risk.record.issues_open,
+                "funding_commitment": risk.record.funding_commitment,
+                "value_at_risk": compute_value_risk(risk),
+                "days_since_contact": risk.days_since_contact if risk.days_since_contact is not None else "",
+                "days_to_contract_end": risk.days_to_contract_end if risk.days_to_contract_end is not None else "",
+                "risk_score": risk.risk_score,
+                "risk_tier": risk.risk_tier,
+                "expired": risk.expired,
+                "reasons": "|".join(risk.reasons),
+                "action_code": risk.action_code,
+                "action_note": risk.action_note,
+                "action_priority": risk.action_priority,
+            }
+            for risk in risks
+        ]
+        write_csv(
+            args.csv_out,
+            partner_rows,
+            [
+                "partner_id",
+                "partner_name",
+                "owner",
+                "last_contact_date",
+                "contract_end_date",
+                "engagement_score",
+                "meetings_last_90",
+                "referrals_last_90",
+                "issues_open",
+                "funding_commitment",
+                "value_at_risk",
+                "days_since_contact",
+                "days_to_contract_end",
+                "risk_score",
+                "risk_tier",
+                "expired",
+                "reasons",
+                "action_code",
+                "action_note",
+                "action_priority",
+            ],
+        )
+
+    if args.actions_csv_out:
+        action_rows = [
+            {
+                "partner_id": item.risk.record.partner_id,
+                "partner_name": item.risk.record.partner_name,
+                "owner": item.risk.record.owner,
+                "action_score": item.action_score,
+                "action": item.action,
+                "focus": item.focus,
+                "days_to_contract_end": item.risk.days_to_contract_end
+                if item.risk.days_to_contract_end is not None
+                else "",
+                "days_since_contact": item.risk.days_since_contact
+                if item.risk.days_since_contact is not None
+                else "",
+                "risk_score": item.risk.risk_score,
+                "risk_tier": item.risk.risk_tier,
+            }
+            for item in actions
+        ]
+        write_csv(
+            args.actions_csv_out,
+            action_rows,
+            [
+                "partner_id",
+                "partner_name",
+                "owner",
+                "action_score",
+                "action",
+                "focus",
+                "days_to_contract_end",
+                "days_since_contact",
+                "risk_score",
+                "risk_tier",
+            ],
+        )
+
+    if args.owners_csv_out:
+        owner_rows = [
+            {
+                "owner": owner["owner"],
+                "total_partners": owner["total_partners"],
+                "high_risk": owner["high_risk"],
+                "medium_risk": owner["medium_risk"],
+                "low_risk": owner["low_risk"],
+                "expired_contracts": owner["expired_contracts"],
+                "expiring_within_window": owner["expiring_within_window"],
+                "stale_contacts": owner["stale_contacts"],
+                "average_risk_score": owner["average_risk_score"],
+                "average_engagement": owner["average_engagement"],
+                "total_funding_commitment": owner["total_funding_commitment"],
+                "value_at_risk": owner["value_at_risk"],
+            }
+            for owner in owner_summary
+        ]
+        write_csv(
+            args.owners_csv_out,
+            owner_rows,
+            [
+                "owner",
+                "total_partners",
+                "high_risk",
+                "medium_risk",
+                "low_risk",
+                "expired_contracts",
+                "expiring_within_window",
+                "stale_contacts",
+                "average_risk_score",
+                "average_engagement",
+                "total_funding_commitment",
+                "value_at_risk",
+            ],
+        )
 
     if args.export_postgres:
         export_to_postgres(risks, actions, owner_summary, summary, as_of, args)
