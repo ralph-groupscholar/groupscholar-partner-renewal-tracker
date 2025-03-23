@@ -16,3 +16,13 @@
 
 ## 2026-02-08
 - Added CSV export outputs for partner risk, action queue, and owner summaries.
+
+## 2026-02-08
+- Added renewal calendar buckets (overdue, upcoming months, missing contracts) with console, JSON, HTML, and CSV export support.
+- Expanded HTML report to include renewal calendar table and added coverage for calendar bucketing.
+- Updated README with calendar/HTML usage and options.
+
+## 2026-02-08
+- Added an SVG renewal funding chart to the HTML report with legend and labels.
+- Extended HTML report tests to validate the chart output.
+- Updated README to reflect the chart and new next step.

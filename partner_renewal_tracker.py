@@ -757,6 +757,45 @@ def build_owner_summary(
     return snapshots
 
 
+def build_reason_summary(risks: List[PartnerRisk]) -> List[Dict[str, float]]:
+    total = len(risks)
+    summary: Dict[str, Dict[str, float]] = {}
+    for risk in risks:
+        reasons = risk.reasons or ["none"]
+        for reason in reasons:
+            bucket = summary.setdefault(
+                reason,
+                {
+                    "reason": reason,
+                    "total_partners": 0,
+                    "high_risk_partners": 0,
+                    "total_funding_commitment": 0.0,
+                    "value_at_risk": 0.0,
+                },
+            )
+            bucket["total_partners"] += 1
+            if risk.risk_tier == "high":
+                bucket["high_risk_partners"] += 1
+            bucket["total_funding_commitment"] = round(
+                float(bucket["total_funding_commitment"]) + risk.record.funding_commitment,
+                2,
+            )
+            bucket["value_at_risk"] = round(
+                float(bucket["value_at_risk"]) + compute_value_risk(risk),
+                2,
+            )
+
+    rows = list(summary.values())
+    for row in rows:
+        percent = (row["total_partners"] / total * 100.0) if total else 0.0
+        row["percent_of_partners"] = round(percent, 2)
+    rows.sort(
+        key=lambda r: (r["value_at_risk"], r["total_partners"], r["reason"]),
+        reverse=True,
+    )
+    return rows
+
+
 def build_action_plan(
     risk: PartnerRisk,
     renewal_window_days: int,
@@ -828,13 +867,489 @@ def write_csv(path: str, rows: List[Dict[str, object]], fieldnames: List[str]) -
             writer.writerow(row)
 
 
+def html_escape(value: object) -> str:
+    text = "" if value is None else str(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
+    )
+
+
+def month_bucket_label(year: int, month: int) -> str:
+    return date(year, month, 1).strftime("%b %Y")
+
+
+def build_renewal_calendar(
+    risks: List[PartnerRisk],
+    as_of: date,
+    months: int,
+) -> List[Dict[str, object]]:
+    if months <= 0:
+        return []
+
+    buckets: Dict[str, Dict[str, object]] = {}
+    overdue_key = "overdue"
+    missing_key = "missing_contract"
+
+    def init_bucket(bucket: str, label: str) -> None:
+        if bucket not in buckets:
+            buckets[bucket] = {
+                "bucket": bucket,
+                "label": label,
+                "expiring_partners": 0,
+                "expiring_funding": 0.0,
+                "high_risk_partners": 0,
+                "high_risk_funding": 0.0,
+            }
+
+    init_bucket(overdue_key, "Overdue")
+    init_bucket(missing_key, "Missing contract date")
+
+    months_list: List[Tuple[int, int]] = []
+    year = as_of.year
+    month = as_of.month
+    for _ in range(months):
+        months_list.append((year, month))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+
+    for year, month in months_list:
+        key = f"{year:04d}-{month:02d}"
+        init_bucket(key, month_bucket_label(year, month))
+
+    for risk in risks:
+        contract_end = risk.record.contract_end_date
+        if contract_end is None:
+            bucket_key = missing_key
+        elif contract_end < as_of:
+            bucket_key = overdue_key
+        else:
+            bucket_key = f"{contract_end.year:04d}-{contract_end.month:02d}"
+            if bucket_key not in buckets:
+                continue
+        bucket = buckets[bucket_key]
+        bucket["expiring_partners"] += 1
+        bucket["expiring_funding"] = round(
+            float(bucket["expiring_funding"]) + risk.record.funding_commitment, 2
+        )
+        if risk.risk_tier == "high":
+            bucket["high_risk_partners"] += 1
+            bucket["high_risk_funding"] = round(
+                float(bucket["high_risk_funding"]) + risk.record.funding_commitment, 2
+            )
+
+    ordered: List[Dict[str, object]] = []
+    ordered.append(buckets[overdue_key])
+    for year, month in months_list:
+        ordered.append(buckets[f"{year:04d}-{month:02d}"])
+    ordered.append(buckets[missing_key])
+    return ordered
+
+
+def write_html_report(
+    path: str,
+    as_of: date,
+    summary: Dict[str, float],
+    top: List[PartnerRisk],
+    top_value: List[PartnerRisk],
+    actions: List[PartnerAction],
+    owners: List[Dict[str, float]],
+    calendar: List[Dict[str, object]],
+    warnings: List[str],
+) -> None:
+    if not path:
+        return
+    rows_top = "\n".join(
+        f"<tr><td>{html_escape(r.record.partner_name)}</td>"
+        f"<td>{html_escape(r.record.partner_id)}</td>"
+        f"<td>{r.risk_score}</td>"
+        f"<td>{html_escape(r.risk_tier)}</td>"
+        f"<td>{'' if r.days_to_contract_end is None else r.days_to_contract_end}</td>"
+        f"<td>{'' if r.days_since_contact is None else r.days_since_contact}</td>"
+        f"<td>{html_escape(', '.join(r.reasons))}</td></tr>"
+        for r in top
+    )
+    rows_value = "\n".join(
+        f"<tr><td>{html_escape(r.record.partner_name)}</td>"
+        f"<td>{html_escape(r.record.partner_id)}</td>"
+        f"<td>{r.record.funding_commitment}</td>"
+        f"<td>{compute_value_risk(r)}</td>"
+        f"<td>{r.risk_score}</td>"
+        f"<td>{html_escape(r.risk_tier)}</td></tr>"
+        for r in top_value
+    )
+    rows_actions = "\n".join(
+        f"<tr><td>{html_escape(a.risk.record.partner_name)}</td>"
+        f"<td>{html_escape(a.risk.record.partner_id)}</td>"
+        f"<td>{a.action_score}</td>"
+        f"<td>{html_escape(a.action)}</td>"
+        f"<td>{html_escape(a.focus)}</td>"
+        f"<td>{'' if a.risk.days_to_contract_end is None else a.risk.days_to_contract_end}</td>"
+        f"<td>{'' if a.risk.days_since_contact is None else a.risk.days_since_contact}</td>"
+        f"<td>{a.risk.risk_score}</td></tr>"
+        for a in actions
+    )
+    rows_owners = "\n".join(
+        f"<tr><td>{html_escape(o['owner'])}</td>"
+        f"<td>{o['total_partners']}</td>"
+        f"<td>{o['high_risk']}</td>"
+        f"<td>{o['medium_risk']}</td>"
+        f"<td>{o['low_risk']}</td>"
+        f"<td>{o['expiring_within_window']}</td>"
+        f"<td>{o['stale_contacts']}</td>"
+        f"<td>{o['average_risk_score']}</td>"
+        f"<td>{o['value_at_risk']}</td></tr>"
+        for o in owners
+    )
+    rows_calendar = "\n".join(
+        f"<tr><td>{html_escape(item['label'])}</td>"
+        f"<td>{item['expiring_partners']}</td>"
+        f"<td>{item['expiring_funding']}</td>"
+        f"<td>{item['high_risk_partners']}</td>"
+        f"<td>{item['high_risk_funding']}</td></tr>"
+        for item in calendar
+    )
+    calendar_chart = build_calendar_chart_html(calendar)
+    warning_list = ""
+    if warnings:
+        warning_items = "\n".join(f"<li>{html_escape(item)}</li>" for item in warnings)
+        warning_list = f"<section><h2>Warnings</h2><ul>{warning_items}</ul></section>"
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Partner Renewal Tracker Report</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --ink: #1f1f1f;
+      --muted: #4a4a4a;
+      --panel: #f3f4f6;
+      --accent: #1f6feb;
+      --border: #d5d7db;
+    }}
+    body {{
+      font-family: "Georgia", "Times New Roman", serif;
+      color: var(--ink);
+      margin: 0;
+      background: #faf9f6;
+    }}
+    header {{
+      padding: 32px 40px 12px;
+      background: linear-gradient(120deg, #fff8e8, #f2f7ff);
+      border-bottom: 1px solid var(--border);
+    }}
+    header h1 {{
+      margin: 0;
+      font-size: 30px;
+    }}
+    header p {{
+      margin: 8px 0 0;
+      color: var(--muted);
+    }}
+    main {{
+      padding: 28px 40px 48px;
+    }}
+    section {{
+      margin-bottom: 28px;
+    }}
+    h2 {{
+      margin: 0 0 12px;
+      font-size: 20px;
+    }}
+    .summary-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }}
+    .summary-card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+    }}
+    .summary-card span {{
+      display: block;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }}
+    .summary-card strong {{
+      font-size: 20px;
+      display: block;
+      margin-top: 6px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }}
+    th, td {{
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+    }}
+    th {{
+      background: #f8f7f3;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }}
+    .note {{
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .chart {{
+      margin: 12px 0 18px;
+      padding: 12px;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }}
+    .chart svg {{
+      width: 100%;
+      height: auto;
+    }}
+    .chart-legend {{
+      display: flex;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 8px;
+    }}
+    .legend-swatch {{
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      margin-right: 6px;
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Partner Renewal Tracker</h1>
+    <p>Report date: {as_of.strftime(DATE_FMT)}</p>
+  </header>
+  <main>
+    <section>
+      <h2>Summary</h2>
+      <div class="summary-grid">
+        <div class="summary-card"><span>Total partners</span><strong>{summary['total_partners']}</strong></div>
+        <div class="summary-card"><span>High risk</span><strong>{summary['high_risk']}</strong></div>
+        <div class="summary-card"><span>Medium risk</span><strong>{summary['medium_risk']}</strong></div>
+        <div class="summary-card"><span>Low risk</span><strong>{summary['low_risk']}</strong></div>
+        <div class="summary-card"><span>Expired contracts</span><strong>{summary['expired_contracts']}</strong></div>
+        <div class="summary-card"><span>Expiring window</span><strong>{summary['expiring_within_window']}</strong></div>
+        <div class="summary-card"><span>Stale contacts</span><strong>{summary['stale_contacts']}</strong></div>
+        <div class="summary-card"><span>Total funding</span><strong>{summary['total_funding_commitment']}</strong></div>
+        <div class="summary-card"><span>High-risk funding</span><strong>{summary['high_risk_funding']}</strong></div>
+        <div class="summary-card"><span>Avg risk score</span><strong>{summary['average_risk_score']}</strong></div>
+        <div class="summary-card"><span>Avg value at risk</span><strong>{summary['average_value_at_risk']}</strong></div>
+        <div class="summary-card"><span>Avg engagement</span><strong>{summary['average_engagement']}</strong></div>
+      </div>
+      <p class="note">Weight profile: {html_escape(summary['weight_profile'])}</p>
+    </section>
+
+    <section>
+      <h2>Top at-risk partners</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Partner</th>
+            <th>ID</th>
+            <th>Score</th>
+            <th>Tier</th>
+            <th>Days to end</th>
+            <th>Days since contact</th>
+            <th>Reasons</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_top or '<tr><td colspan="7">No partners found.</td></tr>'}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Top value at risk</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Partner</th>
+            <th>ID</th>
+            <th>Commitment</th>
+            <th>Value at risk</th>
+            <th>Score</th>
+            <th>Tier</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_value or '<tr><td colspan="6">No partners found.</td></tr>'}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Action queue</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Partner</th>
+            <th>ID</th>
+            <th>Action score</th>
+            <th>Action</th>
+            <th>Focus</th>
+            <th>Days to end</th>
+            <th>Days since contact</th>
+            <th>Risk score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_actions or '<tr><td colspan="8">No actions found.</td></tr>'}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Owner snapshot</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Owner</th>
+            <th>Partners</th>
+            <th>High</th>
+            <th>Medium</th>
+            <th>Low</th>
+            <th>Expiring</th>
+            <th>Stale</th>
+            <th>Avg risk</th>
+            <th>Value at risk</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_owners or '<tr><td colspan="9">No owners found.</td></tr>'}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Renewal calendar</h2>
+      {calendar_chart}
+      <table>
+        <thead>
+          <tr>
+            <th>Bucket</th>
+            <th>Partners</th>
+            <th>Funding</th>
+            <th>High-risk partners</th>
+            <th>High-risk funding</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_calendar or '<tr><td colspan="5">No calendar data.</td></tr>'}
+        </tbody>
+      </table>
+    </section>
+    {warning_list}
+  </main>
+</body>
+</html>
+"""
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(html)
+
+
+def build_calendar_chart_html(calendar: List[Dict[str, object]]) -> str:
+    if not calendar:
+        return "<p class=\"note\">No calendar data available.</p>"
+
+    values = [
+        max(float(item.get("expiring_funding", 0.0)), float(item.get("high_risk_funding", 0.0)))
+        for item in calendar
+    ]
+    max_value = max(values) if values else 0.0
+    if max_value <= 0:
+        return "<p class=\"note\">No funding values to chart yet.</p>"
+
+    width = 680
+    height = 240
+    padding = 36
+    baseline = height - padding
+    chart_width = width - padding * 2
+    chart_height = height - padding * 2
+    bucket_width = chart_width / max(len(calendar), 1)
+    bar_width = max(bucket_width * 0.28, 10)
+    scale = chart_height / max_value if max_value else 0.0
+
+    def label_for(item: Dict[str, object]) -> str:
+        bucket = str(item.get("bucket", ""))
+        label = str(item.get("label", ""))
+        if bucket == "overdue":
+            return "Overdue"
+        if bucket == "missing_contract":
+            return "Missing"
+        if len(label) > 9:
+            return label.split()[0]
+        return label
+
+    bars = []
+    labels = []
+    for idx, item in enumerate(calendar):
+        expiring = float(item.get("expiring_funding", 0.0))
+        high_risk = float(item.get("high_risk_funding", 0.0))
+        x_center = padding + bucket_width * idx + bucket_width / 2
+        exp_height = expiring * scale
+        high_height = high_risk * scale
+        exp_x = x_center - bar_width - 2
+        high_x = x_center + 2
+        bars.append(
+            f'<rect x="{exp_x:.1f}" y="{baseline - exp_height:.1f}" '
+            f'width="{bar_width:.1f}" height="{exp_height:.1f}" fill="#1f6feb" opacity="0.85"></rect>'
+        )
+        bars.append(
+            f'<rect x="{high_x:.1f}" y="{baseline - high_height:.1f}" '
+            f'width="{bar_width:.1f}" height="{high_height:.1f}" fill="#f97316" opacity="0.85"></rect>'
+        )
+        labels.append(
+            f'<text x="{x_center:.1f}" y="{height - 10}" font-size="10" '
+            f'text-anchor="middle" fill="#4a4a4a">{html_escape(label_for(item))}</text>'
+        )
+
+    svg = (
+        f'<div class="chart">'
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Renewal funding by bucket">'
+        f'<line x1="{padding}" y1="{baseline}" x2="{width - padding}" y2="{baseline}" stroke="#d5d7db" />'
+        f'{"".join(bars)}'
+        f'{"".join(labels)}'
+        f'</svg>'
+        f'<div class="chart-legend">'
+        f'<span><span class="legend-swatch" style="background:#1f6feb"></span>Expiring funding</span>'
+        f'<span><span class="legend-swatch" style="background:#f97316"></span>High-risk funding</span>'
+        f'</div>'
+        f'</div>'
+    )
+    return svg
+
+
 def render_console(
     summary: Dict[str, float],
     top: List[PartnerRisk],
     top_value: List[PartnerRisk],
     actions: List[PartnerAction],
     owners: List[Dict[str, float]],
+    calendar: List[Dict[str, object]],
     top_owners: int,
+    calendar_months: int,
 ) -> None:
     print("Partner Renewal Tracker")
     print("=" * 26)
@@ -897,6 +1412,14 @@ def render_console(
                 f"expiring {owner['expiring_within_window']} | value_at_risk {owner['value_at_risk']} | "
                 f"avg_risk {owner['average_risk_score']}"
             )
+    if calendar:
+        print(f"\nRenewal calendar (next {calendar_months} months)")
+        print("-" * 26)
+        for item in calendar:
+            print(
+                f"{item['label']} | partners {item['expiring_partners']} | funding {item['expiring_funding']} | "
+                f"high_risk {item['high_risk_partners']}"
+            )
 
 
 def main() -> None:
@@ -904,15 +1427,18 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Path to partner CSV export.")
     parser.add_argument("--as-of", help="Override as-of date (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--json-out", help="Optional path for JSON report output.")
+    parser.add_argument("--html-out", help="Optional path for HTML report output.")
     parser.add_argument("--csv-out", help="Optional path for partner risk CSV export.")
     parser.add_argument("--actions-csv-out", help="Optional path for action queue CSV export.")
     parser.add_argument("--owners-csv-out", help="Optional path for owner summary CSV export.")
+    parser.add_argument("--calendar-csv-out", help="Optional path for renewal calendar CSV export.")
     parser.add_argument("--export-postgres", action="store_true", help="Write results to Postgres.")
     parser.add_argument("--run-label", help="Optional label to store with Postgres run.")
     parser.add_argument("--top", type=int, default=10, help="How many top at-risk partners to show.")
     parser.add_argument("--top-value", type=int, default=5, help="How many top value-at-risk partners to show.")
     parser.add_argument("--top-actions", type=int, default=8, help="How many action queue partners to show.")
     parser.add_argument("--top-owners", type=int, default=6, help="How many owners to list in snapshot.")
+    parser.add_argument("--calendar-months", type=int, default=6, help="Months to include in renewal calendar.")
     parser.add_argument("--stale-contact-days", type=int, default=45)
     parser.add_argument("--renewal-window-days", type=int, default=90)
     parser.add_argument("--low-engagement-threshold", type=float, default=55.0)
@@ -977,6 +1503,7 @@ def main() -> None:
     actions.sort(key=lambda item: (item.action_score, item.risk.risk_score, item.risk.record.partner_name), reverse=True)
     summary = summarize(risks, args.renewal_window_days, args.stale_contact_days, weights)
     owner_summary = build_owner_summary(risks, args.renewal_window_days, args.stale_contact_days)
+    renewal_calendar = build_renewal_calendar(risks, as_of, args.calendar_months)
 
     render_console(
         summary,
@@ -984,7 +1511,9 @@ def main() -> None:
         value_ranked[: args.top_value],
         actions[: args.top_actions],
         owner_summary,
+        renewal_calendar,
         args.top_owners,
+        args.calendar_months,
     )
 
     if warnings:
@@ -998,6 +1527,7 @@ def main() -> None:
             "as_of": as_of.strftime(DATE_FMT),
             "summary": summary,
             "owner_summary": owner_summary,
+            "renewal_calendar": renewal_calendar,
             "partners": [
                 {
                     "partner_id": risk.record.partner_id,
@@ -1040,6 +1570,19 @@ def main() -> None:
         }
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+
+    if args.html_out:
+        write_html_report(
+            args.html_out,
+            as_of,
+            summary,
+            risks[: args.top],
+            value_ranked[: args.top_value],
+            actions[: args.top_actions],
+            owner_summary[: args.top_owners],
+            renewal_calendar,
+            warnings,
+        )
 
     if args.csv_out:
         partner_rows = [
@@ -1169,6 +1712,31 @@ def main() -> None:
                 "average_engagement",
                 "total_funding_commitment",
                 "value_at_risk",
+            ],
+        )
+
+    if args.calendar_csv_out:
+        calendar_rows = [
+            {
+                "bucket": item["bucket"],
+                "label": item["label"],
+                "expiring_partners": item["expiring_partners"],
+                "expiring_funding": item["expiring_funding"],
+                "high_risk_partners": item["high_risk_partners"],
+                "high_risk_funding": item["high_risk_funding"],
+            }
+            for item in renewal_calendar
+        ]
+        write_csv(
+            args.calendar_csv_out,
+            calendar_rows,
+            [
+                "bucket",
+                "label",
+                "expiring_partners",
+                "expiring_funding",
+                "high_risk_partners",
+                "high_risk_funding",
             ],
         )
 

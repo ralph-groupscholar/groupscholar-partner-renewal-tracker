@@ -9,8 +9,9 @@ A lightweight CLI that turns partner engagement exports into renewal risk signal
 - Highlights funding commitments tied to expiring or stale relationships
 - Adds an action queue with recommended next steps and priority scores
 - Provides an owner risk snapshot to focus renewal outreach by owner
-- Emits JSON reports for downstream dashboards
+- Emits JSON and HTML reports for downstream dashboards
 - Exports CSV snapshots for partners, actions, and owner summaries
+- Adds a renewal calendar (overdue + upcoming months) with optional CSV export and SVG chart
 - Works with simple CSV exports (aliases for common header names)
 
 ## Usage
@@ -19,10 +20,16 @@ A lightweight CLI that turns partner engagement exports into renewal risk signal
 python3 partner_renewal_tracker.py --input sample/partners.csv --as-of 2026-02-07 --json-out report.json
 ```
 
+Generate an HTML report and renewal calendar export:
+
+```bash
+python3 partner_renewal_tracker.py --input sample/partners.csv --html-out report.html --calendar-csv-out calendar.csv
+```
+
 Export CSV snapshots:
 
 ```bash
-python3 partner_renewal_tracker.py --input sample/partners.csv --csv-out partners.csv --actions-csv-out actions.csv --owners-csv-out owners.csv
+python3 partner_renewal_tracker.py --input sample/partners.csv --csv-out partners.csv --actions-csv-out actions.csv --owners-csv-out owners.csv --calendar-csv-out calendar.csv
 ```
 
 Store a run in Postgres (production):
@@ -48,6 +55,8 @@ Note: Postgres export is intended for deployed/production usage. Do not point it
 - `--csv-out`: CSV export path for partner risk snapshot
 - `--actions-csv-out`: CSV export path for action queue snapshot
 - `--owners-csv-out`: CSV export path for owner summary snapshot
+- `--calendar-csv-out`: CSV export path for renewal calendar snapshot
+- `--calendar-months` (default 6): months to include in renewal calendar
 - `--export-postgres`: store results in Postgres (requires env vars)
 - `--run-label`: optional label stored with the Postgres run
 
@@ -73,4 +82,4 @@ Expected headers (aliases accepted):
 - psycopg (for Postgres export)
 
 ## Next steps
-- Add lightweight HTML report output
+- Add per-owner renewal calendar breakdowns
