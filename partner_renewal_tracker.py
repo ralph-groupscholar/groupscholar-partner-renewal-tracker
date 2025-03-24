@@ -726,8 +726,8 @@ def export_to_postgres(
                         owner["value_at_risk"],
                     )
                     for owner in owner_summary
-            ],
-        )
+                ],
+            )
 
             if renewal_calendar:
                 cursor.executemany(
