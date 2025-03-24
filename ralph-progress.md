@@ -26,3 +26,7 @@
 - Added an SVG renewal funding chart to the HTML report with legend and labels.
 - Extended HTML report tests to validate the chart output.
 - Updated README to reflect the chart and new next step.
+
+## 2026-02-08
+- Fixed Postgres schema setup to avoid duplicate owner calendar tables.
+- Repaired renewal calendar export indentation for Postgres runs.

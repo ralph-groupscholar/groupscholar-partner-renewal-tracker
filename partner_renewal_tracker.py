@@ -512,12 +512,58 @@ def ensure_schema(cursor, schema: str) -> None:
         )
         """
     )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.renewal_calendar (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES {schema}.renewal_runs(id) ON DELETE CASCADE,
+            bucket TEXT NOT NULL,
+            label TEXT NOT NULL,
+            expiring_partners INTEGER NOT NULL,
+            expiring_funding NUMERIC NOT NULL,
+            high_risk_partners INTEGER NOT NULL,
+            high_risk_funding NUMERIC NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.owner_calendar (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES {schema}.renewal_runs(id) ON DELETE CASCADE,
+            owner TEXT NOT NULL,
+            bucket TEXT NOT NULL,
+            label TEXT NOT NULL,
+            expiring_partners INTEGER NOT NULL,
+            expiring_funding NUMERIC NOT NULL,
+            high_risk_partners INTEGER NOT NULL,
+            high_risk_funding NUMERIC NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.risk_drivers (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES {schema}.renewal_runs(id) ON DELETE CASCADE,
+            reason TEXT NOT NULL,
+            total_partners INTEGER NOT NULL,
+            high_risk_partners INTEGER NOT NULL,
+            total_funding_commitment NUMERIC NOT NULL,
+            value_at_risk NUMERIC NOT NULL,
+            percent_of_partners NUMERIC NOT NULL
+        )
+        """
+    )
 
 
 def export_to_postgres(
     risks: List[PartnerRisk],
     actions: List[PartnerAction],
     owner_summary: List[Dict[str, float]],
+    renewal_calendar: List[Dict[str, object]],
+    owner_calendars: List[Dict[str, object]],
+    reasons: List[Dict[str, float]],
     summary: Dict[str, object],
     as_of: date,
     args: argparse.Namespace,
@@ -680,8 +726,81 @@ def export_to_postgres(
                         owner["value_at_risk"],
                     )
                     for owner in owner_summary
-                ],
-            )
+            ],
+        )
+
+            if renewal_calendar:
+                cursor.executemany(
+                    f"""
+                    INSERT INTO {schema}.renewal_calendar (
+                        run_id, bucket, label, expiring_partners, expiring_funding,
+                        high_risk_partners, high_risk_funding
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            run_id,
+                            item["bucket"],
+                            item["label"],
+                            item["expiring_partners"],
+                            item["expiring_funding"],
+                            item["high_risk_partners"],
+                            item["high_risk_funding"],
+                        )
+                        for item in renewal_calendar
+                    ],
+                )
+
+            if owner_calendars:
+                owner_rows = []
+                for owner in owner_calendars:
+                    for item in owner["calendar"]:
+                        owner_rows.append(
+                            (
+                                run_id,
+                                owner["owner"],
+                                item["bucket"],
+                                item["label"],
+                                item["expiring_partners"],
+                                item["expiring_funding"],
+                                item["high_risk_partners"],
+                                item["high_risk_funding"],
+                            )
+                        )
+                cursor.executemany(
+                    f"""
+                    INSERT INTO {schema}.owner_calendar (
+                        run_id, owner, bucket, label, expiring_partners,
+                        expiring_funding, high_risk_partners, high_risk_funding
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    owner_rows,
+                )
+
+            if reasons:
+                cursor.executemany(
+                    f"""
+                    INSERT INTO {schema}.risk_drivers (
+                        run_id, reason, total_partners, high_risk_partners,
+                        total_funding_commitment, value_at_risk, percent_of_partners
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            run_id,
+                            item["reason"],
+                            item["total_partners"],
+                            item["high_risk_partners"],
+                            item["total_funding_commitment"],
+                            item["value_at_risk"],
+                            item["percent_of_partners"],
+                        )
+                        for item in reasons
+                    ],
+                )
 
 
 def resolve_weights(
@@ -951,6 +1070,45 @@ def build_renewal_calendar(
     return ordered
 
 
+def build_owner_renewal_calendars(
+    risks: List[PartnerRisk],
+    as_of: date,
+    months: int,
+) -> List[Dict[str, object]]:
+    owners: Dict[str, List[PartnerRisk]] = {}
+    for risk in risks:
+        owners.setdefault(risk.record.owner, []).append(risk)
+
+    calendars: List[Dict[str, object]] = []
+    for owner, items in owners.items():
+        calendar = build_renewal_calendar(items, as_of, months)
+        total_partners = sum(item["expiring_partners"] for item in calendar)
+        total_funding = sum(float(item["expiring_funding"]) for item in calendar)
+        high_risk_partners = sum(item["high_risk_partners"] for item in calendar)
+        high_risk_funding = sum(float(item["high_risk_funding"]) for item in calendar)
+        calendars.append(
+            {
+                "owner": owner,
+                "total_expiring_partners": total_partners,
+                "total_expiring_funding": round(total_funding, 2),
+                "high_risk_partners": high_risk_partners,
+                "high_risk_funding": round(high_risk_funding, 2),
+                "calendar": calendar,
+            }
+        )
+
+    calendars.sort(
+        key=lambda item: (
+            item["total_expiring_funding"],
+            item["high_risk_funding"],
+            item["total_expiring_partners"],
+            item["owner"],
+        ),
+        reverse=True,
+    )
+    return calendars
+
+
 def write_html_report(
     path: str,
     as_of: date,
@@ -959,7 +1117,9 @@ def write_html_report(
     top_value: List[PartnerRisk],
     actions: List[PartnerAction],
     owners: List[Dict[str, float]],
+    owner_calendars: List[Dict[str, object]],
     calendar: List[Dict[str, object]],
+    reasons: List[Dict[str, float]],
     warnings: List[str],
 ) -> None:
     if not path:
@@ -1006,6 +1166,34 @@ def write_html_report(
         f"<td>{o['value_at_risk']}</td></tr>"
         for o in owners
     )
+    owner_calendar_sections = ""
+    empty_owner_calendar_row = "<tr><td colspan='5'>No calendar data.</td></tr>"
+    if owner_calendars:
+        owner_tables = []
+        for owner in owner_calendars:
+            rows = "\n".join(
+                f"<tr><td>{html_escape(item['label'])}</td>"
+                f"<td>{item['expiring_partners']}</td>"
+                f"<td>{item['expiring_funding']}</td>"
+                f"<td>{item['high_risk_partners']}</td>"
+                f"<td>{item['high_risk_funding']}</td></tr>"
+                for item in owner["calendar"]
+            )
+            owner_tables.append(
+                f"<div class=\"owner-calendar\">"
+                f"<h3>{html_escape(owner['owner'])}</h3>"
+                f"<p class=\"note\">Expiring funding: {owner['total_expiring_funding']} | "
+                f"High-risk funding: {owner['high_risk_funding']}</p>"
+                f"<table>"
+                f"<thead><tr>"
+                f"<th>Bucket</th><th>Partners</th><th>Funding</th>"
+                f"<th>High-risk partners</th><th>High-risk funding</th>"
+                f"</tr></thead>"
+                f"<tbody>{rows or empty_owner_calendar_row}</tbody>"
+                f"</table>"
+                f"</div>"
+            )
+        owner_calendar_sections = "".join(owner_tables)
     rows_calendar = "\n".join(
         f"<tr><td>{html_escape(item['label'])}</td>"
         f"<td>{item['expiring_partners']}</td>"
@@ -1013,6 +1201,15 @@ def write_html_report(
         f"<td>{item['high_risk_partners']}</td>"
         f"<td>{item['high_risk_funding']}</td></tr>"
         for item in calendar
+    )
+    rows_reasons = "\n".join(
+        f"<tr><td>{html_escape(item['reason'])}</td>"
+        f"<td>{item['total_partners']}</td>"
+        f"<td>{item['high_risk_partners']}</td>"
+        f"<td>{item['total_funding_commitment']}</td>"
+        f"<td>{item['value_at_risk']}</td>"
+        f"<td>{item['percent_of_partners']}%</td></tr>"
+        for item in reasons
     )
     calendar_chart = build_calendar_chart_html(calendar)
     warning_list = ""
@@ -1133,6 +1330,17 @@ def write_html_report(
       border-radius: 3px;
       margin-right: 6px;
     }}
+    .owner-calendar {{
+      margin-bottom: 18px;
+      padding: 12px 14px;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }}
+    .owner-calendar h3 {{
+      margin: 0 0 6px;
+      font-size: 16px;
+    }}
   </style>
 </head>
 <body>
@@ -1243,6 +1451,11 @@ def write_html_report(
     </section>
 
     <section>
+      <h2>Owner renewal calendars</h2>
+      {owner_calendar_sections or '<p class="note">No owner calendar data available.</p>'}
+    </section>
+
+    <section>
       <h2>Renewal calendar</h2>
       {calendar_chart}
       <table>
@@ -1257,6 +1470,25 @@ def write_html_report(
         </thead>
         <tbody>
           {rows_calendar or '<tr><td colspan="5">No calendar data.</td></tr>'}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Risk drivers</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Reason</th>
+            <th>Partners</th>
+            <th>High risk</th>
+            <th>Funding</th>
+            <th>Value at risk</th>
+            <th>Share</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_reasons or '<tr><td colspan="6">No driver data.</td></tr>'}
         </tbody>
       </table>
     </section>
@@ -1347,8 +1579,11 @@ def render_console(
     top_value: List[PartnerRisk],
     actions: List[PartnerAction],
     owners: List[Dict[str, float]],
+    owner_calendars: List[Dict[str, object]],
     calendar: List[Dict[str, object]],
+    reasons: List[Dict[str, float]],
     top_owners: int,
+    top_reasons: int,
     calendar_months: int,
 ) -> None:
     print("Partner Renewal Tracker")
@@ -1375,12 +1610,12 @@ def render_console(
         return
     for risk in top:
         record = risk.record
-        reasons = ", ".join(risk.reasons) if risk.reasons else "none"
+        reasons_text = ", ".join(risk.reasons) if risk.reasons else "none"
         days_to_end = "n/a" if risk.days_to_contract_end is None else str(risk.days_to_contract_end)
         days_since = "n/a" if risk.days_since_contact is None else str(risk.days_since_contact)
         print(
             f"{record.partner_name} ({record.partner_id}) | score {risk.risk_score} | tier {risk.risk_tier} | "
-            f"days_to_end {days_to_end} | days_since_contact {days_since} | reasons: {reasons}"
+            f"days_to_end {days_to_end} | days_since_contact {days_since} | reasons: {reasons_text}"
         )
     if top_value:
         print("\nTop value at risk")
@@ -1412,6 +1647,20 @@ def render_console(
                 f"expiring {owner['expiring_within_window']} | value_at_risk {owner['value_at_risk']} | "
                 f"avg_risk {owner['average_risk_score']}"
             )
+    if owner_calendars:
+        print("\nOwner renewal calendars")
+        print("-" * 26)
+        for owner in owner_calendars[:top_owners]:
+            highlights = [
+                f"{item['label']}:{item['expiring_partners']}"
+                for item in owner["calendar"]
+                if item["expiring_partners"] > 0
+            ]
+            highlight_text = ", ".join(highlights) if highlights else "no upcoming renewals"
+            print(
+                f"{owner['owner']} | expiring_funding {owner['total_expiring_funding']} | "
+                f"high_risk_funding {owner['high_risk_funding']} | {highlight_text}"
+            )
     if calendar:
         print(f"\nRenewal calendar (next {calendar_months} months)")
         print("-" * 26)
@@ -1419,6 +1668,14 @@ def render_console(
             print(
                 f"{item['label']} | partners {item['expiring_partners']} | funding {item['expiring_funding']} | "
                 f"high_risk {item['high_risk_partners']}"
+            )
+    if reasons:
+        print("\nTop risk drivers")
+        print("-" * 26)
+        for item in reasons[:top_reasons]:
+            print(
+                f"{item['reason']} | partners {item['total_partners']} | high_risk {item['high_risk_partners']} | "
+                f"value_at_risk {item['value_at_risk']}"
             )
 
 
@@ -1432,12 +1689,15 @@ def main() -> None:
     parser.add_argument("--actions-csv-out", help="Optional path for action queue CSV export.")
     parser.add_argument("--owners-csv-out", help="Optional path for owner summary CSV export.")
     parser.add_argument("--calendar-csv-out", help="Optional path for renewal calendar CSV export.")
+    parser.add_argument("--owner-calendar-csv-out", help="Optional path for owner renewal calendar CSV export.")
+    parser.add_argument("--reasons-csv-out", help="Optional path for risk driver CSV export.")
     parser.add_argument("--export-postgres", action="store_true", help="Write results to Postgres.")
     parser.add_argument("--run-label", help="Optional label to store with Postgres run.")
     parser.add_argument("--top", type=int, default=10, help="How many top at-risk partners to show.")
     parser.add_argument("--top-value", type=int, default=5, help="How many top value-at-risk partners to show.")
     parser.add_argument("--top-actions", type=int, default=8, help="How many action queue partners to show.")
     parser.add_argument("--top-owners", type=int, default=6, help="How many owners to list in snapshot.")
+    parser.add_argument("--top-reasons", type=int, default=6, help="How many risk drivers to list.")
     parser.add_argument("--calendar-months", type=int, default=6, help="Months to include in renewal calendar.")
     parser.add_argument("--stale-contact-days", type=int, default=45)
     parser.add_argument("--renewal-window-days", type=int, default=90)
@@ -1504,6 +1764,8 @@ def main() -> None:
     summary = summarize(risks, args.renewal_window_days, args.stale_contact_days, weights)
     owner_summary = build_owner_summary(risks, args.renewal_window_days, args.stale_contact_days)
     renewal_calendar = build_renewal_calendar(risks, as_of, args.calendar_months)
+    owner_calendars = build_owner_renewal_calendars(risks, as_of, args.calendar_months)
+    reasons = build_reason_summary(risks)
 
     render_console(
         summary,
@@ -1511,8 +1773,11 @@ def main() -> None:
         value_ranked[: args.top_value],
         actions[: args.top_actions],
         owner_summary,
+        owner_calendars,
         renewal_calendar,
+        reasons,
         args.top_owners,
+        args.top_reasons,
         args.calendar_months,
     )
 
@@ -1528,6 +1793,8 @@ def main() -> None:
             "summary": summary,
             "owner_summary": owner_summary,
             "renewal_calendar": renewal_calendar,
+            "owner_calendars": owner_calendars,
+            "risk_drivers": reasons,
             "partners": [
                 {
                     "partner_id": risk.record.partner_id,
@@ -1580,7 +1847,9 @@ def main() -> None:
             value_ranked[: args.top_value],
             actions[: args.top_actions],
             owner_summary[: args.top_owners],
+            owner_calendars[: args.top_owners],
             renewal_calendar,
+            reasons,
             warnings,
         )
 
@@ -1740,8 +2009,72 @@ def main() -> None:
             ],
         )
 
+    if args.owner_calendar_csv_out:
+        owner_calendar_rows = []
+        for owner in owner_calendars:
+            for item in owner["calendar"]:
+                owner_calendar_rows.append(
+                    {
+                        "owner": owner["owner"],
+                        "bucket": item["bucket"],
+                        "label": item["label"],
+                        "expiring_partners": item["expiring_partners"],
+                        "expiring_funding": item["expiring_funding"],
+                        "high_risk_partners": item["high_risk_partners"],
+                        "high_risk_funding": item["high_risk_funding"],
+                    }
+                )
+        write_csv(
+            args.owner_calendar_csv_out,
+            owner_calendar_rows,
+            [
+                "owner",
+                "bucket",
+                "label",
+                "expiring_partners",
+                "expiring_funding",
+                "high_risk_partners",
+                "high_risk_funding",
+            ],
+        )
+
+    if args.reasons_csv_out:
+        reason_rows = [
+            {
+                "reason": item["reason"],
+                "total_partners": item["total_partners"],
+                "high_risk_partners": item["high_risk_partners"],
+                "total_funding_commitment": item["total_funding_commitment"],
+                "value_at_risk": item["value_at_risk"],
+                "percent_of_partners": item["percent_of_partners"],
+            }
+            for item in reasons
+        ]
+        write_csv(
+            args.reasons_csv_out,
+            reason_rows,
+            [
+                "reason",
+                "total_partners",
+                "high_risk_partners",
+                "total_funding_commitment",
+                "value_at_risk",
+                "percent_of_partners",
+            ],
+        )
+
     if args.export_postgres:
-        export_to_postgres(risks, actions, owner_summary, summary, as_of, args)
+        export_to_postgres(
+            risks,
+            actions,
+            owner_summary,
+            renewal_calendar,
+            owner_calendars,
+            reasons,
+            summary,
+            as_of,
+            args,
+        )
 
 
 if __name__ == "__main__":
